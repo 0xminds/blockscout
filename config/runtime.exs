@@ -674,7 +674,7 @@ config :explorer, Explorer.Migrator.BackfillMultichainSearchDB,
   concurrency: 1,
   batch_size: ConfigHelper.parse_integer_env_var("MIGRATION_BACKFILL_MULTICHAIN_SEARCH_BATCH_SIZE", 10)
 
-config :explorer, Explorer.Migrator.HeavyIndexOperations.AddLogsBlockHashIndex,
+config :explorer, Explorer.Migrator.HeavyDbIndexOperations.AddLogsBlockHashIndex,
   check_interval:
     ConfigHelper.parse_time_env_var("MIGRATION_HEAVY_INDEX_OPERATIONS_ADD_LOGS_BLOCK_HASH_INDEX_CHECK_INTERVAL", "10m")
 

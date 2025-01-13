@@ -1,4 +1,4 @@
-defmodule Explorer.Migrator.HeavyIndexOperation do
+defmodule Explorer.Migrator.HeavyDbIndexOperation do
   @moduledoc """
   Provides a template for making heavy DB operations such as creation/deletion of new indexes in the large tables
   with tracking status of those migrations.
@@ -13,18 +13,28 @@ defmodule Explorer.Migrator.HeavyIndexOperation do
   @doc """
   This callback returns the string with a psql query to initialize DB operation like creation or deletion of the index.
   """
-  @callback init_query :: String.t()
+  @callback db_index_operation :: :ok | :error
 
   @doc """
   This callback checks DB index operation (creation or deletion) status.
   """
-  @callback check_index_operation_progress() ::
+  @callback check_db_index_operation_progress() ::
               :finished_or_not_started | :finished | :unknown | {:in_progress, String.t()}
 
   @doc """
-  This callback checks existence of DB index.
+  This callback checks existence of DB index and its validity.
   """
-  @callback index_exists?() :: boolean()
+  @callback db_index_exists_and_valid?() ::
+              %{
+                :exists? => boolean(),
+                :valid? => boolean() | nil
+              }
+              | :unknown
+
+  @doc """
+  This callback completes initial index operation.
+  """
+  @callback complete_db_index_operation() :: :ok | :error
 
   @doc """
     This callback updates the migration completion status in the cache.
@@ -46,7 +56,7 @@ defmodule Explorer.Migrator.HeavyIndexOperation do
 
   defmacro __using__(_opts) do
     quote do
-      @behaviour Explorer.Migrator.HeavyIndexOperation
+      @behaviour Explorer.Migrator.HeavyDbIndexOperation
 
       use GenServer, restart: :transient
 
@@ -72,53 +82,73 @@ defmodule Explorer.Migrator.HeavyIndexOperation do
 
       @impl true
       def handle_continue(:ok, state) do
+        Process.send(self(), :initiate_index_operation, [])
+        {:noreply, state}
+      end
+
+      @impl true
+      def handle_info(:check_db_index_operation_progress, state) do
+        with {:index_operation_progress, status} when status in [:finished_or_not_started, :finished] <-
+               {:index_operation_progress, check_db_index_operation_progress()},
+             {:db_index_exists_and_valid?, %{exists?: false, valid?: nil}} <-
+               {:db_index_exists_and_valid?, db_index_exists_and_valid?()} do
+          MigrationStatus.set_status(migration_name(), "started")
+          db_index_operation()
+          schedule_next_db_operation_status_check()
+          {:noreply, state}
+        else
+          {:index_operation_progress, _status} ->
+            schedule_next_db_operation_status_check()
+            {:noreply, state}
+
+          {:db_index_exists_and_valid?, %{exists?: true, valid?: false}} ->
+            Process.send(self(), :index_drop, [])
+            {:noreply, state}
+
+          {:db_index_exists_and_valid?, %{exists?: true, valid?: true}} ->
+            MigrationStatus.set_status(migration_name(), "completed")
+            {:stop, :normal, state}
+        end
+      end
+
+      @impl true
+      def handle_info(:initiate_index_operation, state) do
         case MigrationStatus.fetch(migration_name()) do
           %{status: "completed"} ->
             update_cache()
             {:stop, :normal, state}
 
           migration_status ->
-            with {:index_operation_progress, status} when status in [:finished_or_not_started, :finished] <-
-                   {:index_operation_progress, check_index_operation_progress()},
-                 {:index_exists?, false} <- {:index_exists?, index_exists?()} do
-              MigrationStatus.set_status(migration_name(), "started")
-              SQL.query!(Repo, init_query(), [])
-              schedule_next_status_check()
-            else
-              {:index_operation_progress, _status} ->
-                schedule_next_status_check()
-
-              {:index_exists?, true} ->
-                MigrationStatus.set_status(migration_name(), "completed")
-            end
-
-            {:noreply, (migration_status && migration_status.meta) || %{}}
-        end
-      end
-
-      @impl true
-      def handle_info(:check_index_operation_progress, state) do
-        case check_index_operation_progress() do
-          status when status in [:finished_or_not_started, :finished] ->
-            update_cache()
-            MigrationStatus.set_status(migration_name(), "completed")
-            {:stop, :normal, state}
-
-          _ ->
-            schedule_next_status_check()
-
+            Process.send(self(), :check_db_index_operation_progress, [])
             {:noreply, state}
         end
       end
 
-      @spec run_task() :: any()
-      defp run_task, do: Task.async(fn -> check_index_operation_progress() end)
+      @impl true
+      def handle_info(:index_drop, state) do
+        case complete_db_index_operation() do
+          :ok ->
+            Process.send(self(), :initiate_index_operation, [])
+            {:noreply, state}
 
-      defp schedule_next_status_check(timeout \\ nil) do
+          :error ->
+            schedule_next_index_drop()
+        end
+      end
+
+      defp schedule_next_db_operation_status_check(timeout \\ nil) do
         Process.send_after(
           self(),
-          :check_index_operation_progress,
+          :check_db_index_operation_progress,
           timeout || Application.get_env(:explorer, __MODULE__)[:check_interval] || :timer.minutes(10)
+        )
+      end
+
+      defp schedule_next_index_drop(timeout \\ nil) do
+        Process.send_after(
+          self(),
+          :index_drop,
+          timeout || :timer.seconds(10)
         )
       end
     end
